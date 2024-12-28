@@ -1,0 +1,112 @@
+#self-defined tokenization
+def custom_tokenize(series, seq_len=12):
+    tokens = []
+    for i in range(len(series) - seq_len):
+        input_seq = " , ".join([" ".join(list(str(int(x)))) for x in series[i:i+seq_len]])
+        target = " ".join(list(str(int(series[i+seq_len]))))
+        tokens.append((input_seq, target))
+    return tokens
+custom_data = custom_tokenize(values, seq_len=12)
+custom_inputs, custom_targets = zip(*custom_data)
+custom_train_inputs, custom_test_inputs, custom_train_targets, custom_test_targets = train_test_split(
+    custom_inputs, custom_targets, test_size=0.2, random_state=42
+)
+custom_train_encodings = tokenizer(custom_train_inputs, return_tensors='pt', padding=True, truncation=True)
+custom_train_labels = tokenizer(custom_train_targets, return_tensors='pt', padding=True, truncation=True)
+custom_train_dataset = TimeSeriesDataset(custom_train_encodings, custom_train_labels)
+trainer = Trainer(
+    model=model,
+    args=training_args,
+    train_dataset=custom_train_dataset,
+)
+
+trainer.train()
+model.save_pretrained("./custom_tokenized_gpt2")
+tokenizer.save_pretrained("./custom_tokenized_gpt2")
+import os
+import torch
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+import openai
+from data.serialize import SerializerSettings
+from models.utils import grid_iter
+from models.promptcast import get_promptcast_predictions_data
+from models.darts import get_arima_predictions_data
+from models.llmtime import get_llmtime_predictions_data
+from data.small_context import get_datasets
+from models.validation_likelihood_tuning import get_autotuned_predictions_data
+
+# Configure environment variables and OpenAI settings
+os.environ['OMP_NUM_THREADS'] = '4'
+openai.api_key = os.getenv('OPENAI_API_KEY')
+openai.api_base = os.getenv('OPENAI_API_BASE', 'https://api.openai.com/v1')
+
+# Visualization function for predictions
+def display_predictions(train_data, test_data, predictions, model_label, show_conf_samples=False):
+    pred_series = pd.Series(predictions['median'], index=test_data.index)
+    plt.figure(figsize=(8, 6), dpi=100)
+    plt.plot(train_data, label='Train Data')
+    plt.plot(test_data, label='Actual', color='black')
+    plt.plot(pred_series, label=model_label, color='purple')
+
+    # Confidence interval shading
+    confidence_samples = predictions['samples']
+    lower_bound = np.quantile(confidence_samples, 0.05, axis=0)
+    upper_bound = np.quantile(confidence_samples, 0.95, axis=0)
+    plt.fill_between(pred_series.index, lower_bound, upper_bound, color='purple', alpha=0.3)
+
+    # Optionally show individual samples
+    if show_conf_samples:
+        confidence_samples = confidence_samples.values if isinstance(confidence_samples, pd.DataFrame) else confidence_samples
+        for sample in confidence_samples[:10]:
+            plt.plot(pred_series.index, sample, color='purple', alpha=0.3, linewidth=1)
+
+    plt.legend(loc='upper left')
+
+    # Display negative log-likelihood per day if available
+    if 'NLL/D' in predictions:
+        nll_per_day = predictions['NLL/D']
+        if nll_per_day is not None:
+            plt.text(0.03, 0.85, f'NLL/D: {nll_per_day:.2f}', transform=plt.gca().transAxes, bbox=dict(facecolor='white', alpha=0.5))
+
+    plt.show()
+
+# Log memory usage for debugging
+print(f"CUDA Max Memory Allocated: {torch.cuda.max_memory_allocated()}\n")
+
+# Hyperparameters for models
+model_parameters = {
+    'LLMTime GPT-3.5': {'model': 'gpt-3.5-turbo-instruct', 'alpha': 0.95, 'beta': 0.3, 'basic': False,
+                        'settings': SerializerSettings(base=10, prec=3, signed=True, half_bin_correction=True)},
+    'LLMTime GPT-4': {'model': 'gpt-4', 'alpha': 0.3, 'basic': True, 'temp': 1.0, 'top_p': 0.8,
+                      'settings': SerializerSettings(base=10, prec=3, signed=True, time_sep=', ', bit_sep='', minus_sign='-')},
+    'ARIMA': {'p': [12, 30], 'd': [1, 2], 'q': [0]},
+    'PromptCast': {'model': 'text-davinci-003', 'temp': 0.7, 'settings': SerializerSettings(base=10, prec=0, signed=True, 
+                     time_sep=', ', bit_sep='', plus_sign='', minus_sign='-', half_bin_correction=False, decimal_point='')}
+}
+
+# Model functions for generating predictions
+prediction_functions = {
+    'LLMTime GPT-3.5': get_llmtime_predictions_data,
+    'LLMTime GPT-4': get_llmtime_predictions_data,
+    'ARIMA': get_arima_predictions_data
+}
+
+# Dataset preparation
+available_datasets = get_datasets()
+selected_dataset = 'AirPassengersDataset'
+training_data, testing_data = available_datasets[selected_dataset]
+
+# Iterate through models and generate predictions
+results = {}
+for model_name, pred_func in prediction_functions.items():
+    model_hyperparams = model_parameters[model_name]
+    model_hyperparams['dataset_name'] = selected_dataset
+    hyperparam_combinations = list(grid_iter(model_hyperparams))
+    sample_count = 10
+    predictions = get_autotuned_predictions_data(training_data, testing_data, hyperparam_combinations, sample_count, pred_func, verbose=False, parallel=False)
+    results[model_name] = predictions
+    display_predictions(training_data, testing_data, predictions, model_name, show_conf_samples=True)
+
+
